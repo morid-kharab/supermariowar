@@ -34,13 +34,13 @@ jobs:
         shell: pwsh
         working-directory: smw-uwp
         run: |
-          # 1. Fetch ENet into dependencies/enet if not bundled in the repo
+          # 1. Fetch ENet into dependencies/enet
           if (-not (Test-Path "dependencies/enet/include/enet/enet.h")) {
               if (Test-Path "dependencies/enet") { Remove-Item "dependencies/enet" -Recurse -Force }
               git clone --depth 1 https://github.com/lsalzman/enet.git dependencies/enet
           }
 
-          # 2. Patch ENet win32.c timer calls so UWP partition rules are not violated
+          # 2. Patch ENet win32.c timer calls for UWP
           Get-ChildItem -Path "dependencies/enet" -Filter "win32.c" -Recurse | ForEach-Object {
               $win32c = Get-Content $_.FullName -Raw
               $win32c = $win32c -replace "timeBeginPeriod\s*\([^)]+\)\s*;", "/* timeBeginPeriod */"
@@ -49,8 +49,12 @@ jobs:
               Set-Content -Path $_.FullName -Value $win32c -Encoding UTF8
           }
 
-          # 3. Remove conflicting server-only files (including mainServer.cpp)
-          Get-ChildItem -Path "src/server" -Include "Player.*", "player.*", "Game.*", "game.*", "Room.*", "Server.*", "server.*", "main.*", "mainServer.*" -Recurse -ErrorAction SilentlyContinue | Remove-Item -Force
+          # 3. Copy ONLY NetPeerENet.cpp from src/server into src/smw/network, then delete all .cpp/.c in src/server
+          #    so NetworkLayerENet.cpp is never compiled twice (fixes LNK2005) and NetPeerENet links (fixes LNK2019)
+          Get-ChildItem -Path "src" -Filter "*NetPeerENet*.cpp" -Recurse | Select-Object -First 1 | ForEach-Object {
+              Copy-Item $_.FullName -Destination "src/smw/network/NetPeerENet.cpp" -Force
+          }
+          Get-ChildItem -Path "src/server" -Include "*.cpp", "*.c", "Player.*", "player.*", "Game.*", "game.*", "Room.*", "Server.*", "server.*" -Recurse -ErrorAction SilentlyContinue | Remove-Item -Force
 
           # 4. Create UWP WinMain entry point
           $uwpMain = @'
@@ -83,7 +87,7 @@ jobs:
           $gameCpp = $gameCpp -replace "\bCreateDirectory\s*\(", "CreateDirectoryA("
           Set-Content -Path "src/common/Game.cpp" -Value $gameCpp -Encoding UTF8
 
-          # 7. Patch src/common/path.cpp so saves/options write to Xbox UWP LocalState and stub out legacy SHGetFolderPathA
+          # 7. Patch src/common/path.cpp for Xbox UWP LocalState
           $pathCpp = Get-Content "src/common/path.cpp" -Raw
           if ($pathCpp -notmatch "SDL_filesystem\.h") {
               $pathCpp = "#include `"SDL_filesystem.h`"`n" + $pathCpp
@@ -116,7 +120,7 @@ jobs:
           $pathCpp = $pathCpp -replace "std::string GetHomeDirectory\(\)", $uwpHomePatch
           Set-Content -Path "src/common/path.cpp" -Value $pathCpp -Encoding UTF8
 
-          # 8. Pre-verify every #include "..." in the codebase and map any missing relative header path automatically
+          # 8. Map any missing relative header path automatically (preferring src/smw over src/server)
           $includeBases = @(
               "src/common",
               "src/smw",
@@ -132,8 +136,8 @@ jobs:
               "dependencies/sha1",
               "dependencies/linmath"
           )
-          $allHeaders = Get-ChildItem -Path "src", "dependencies" -Include "*.h", "*.hpp" -Recurse
-          $sourceFiles = Get-ChildItem -Path "src/common", "src/smw", "src/server" -Include "*.cpp", "*.c", "*.h", "*.hpp" -Recurse
+          $allHeaders = Get-ChildItem -Path "src/smw", "src/common", "src/server", "dependencies" -Include "*.h", "*.hpp" -Recurse
+          $sourceFiles = Get-ChildItem -Path "src/common", "src/smw" -Include "*.cpp", "*.c", "*.h", "*.hpp" -Recurse
           foreach ($file in $sourceFiles) {
               $content = Get-Content $file.FullName -Raw
               $incMatches = [regex]::Matches($content, '#include\s+"([^"]+)"')
@@ -154,13 +158,22 @@ jobs:
                           $destDir = Split-Path $destPath -Parent
                           New-Item -ItemType Directory -Force -Path $destDir | Out-Null
                           Copy-Item $candidate.FullName -Destination $destPath -Force
-                          Write-Host "Mapped missing relative include: $inc -> $destPath"
                       }
                   }
               }
           }
 
-          # 9. Generate CMakeLists.txt
+          # 9. Remove any duplicate NetworkLayerENet.cpp or NetPeerENet.cpp so each is compiled exactly once
+          $netLayers = Get-ChildItem -Path "src/common", "src/smw" -Filter "NetworkLayerENet.cpp" -Recurse
+          if ($netLayers.Count -gt 1) {
+              $netLayers | Select-Object -Skip 1 | Remove-Item -Force
+          }
+          $netPeers = Get-ChildItem -Path "src/common", "src/smw" -Filter "NetPeerENet.cpp" -Recurse
+          if ($netPeers.Count -gt 1) {
+              $netPeers | Select-Object -Skip 1 | Remove-Item -Force
+          }
+
+          # 10. Generate CMakeLists.txt
           $uwpCmake = @'
           cmake_minimum_required(VERSION 3.16)
           project(SuperMarioWar LANGUAGES C CXX)
@@ -182,8 +195,6 @@ jobs:
           file(GLOB_RECURSE COMMON_SOURCES
               "src/common/*.cpp"
               "src/common/*.c"
-              "src/server/*.cpp"
-              "src/server/*.c"
               "dependencies/findfirst/*.c"
               "dependencies/Simpleini/*.c"
               "dependencies/Simpleini/*.cpp"
