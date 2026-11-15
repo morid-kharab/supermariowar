@@ -49,8 +49,8 @@ jobs:
               Set-Content -Path $_.FullName -Value $win32c -Encoding UTF8
           }
 
-          # 3. Delete all standalone server files (including mainServer.cpp) while keeping platform_enet
-          Get-ChildItem -Path "src/server" -Include "Player.*", "player.*", "Game.*", "game.*", "Room.*", "Server.*", "main*", "*Server*" -Recurse -ErrorAction SilentlyContinue | Remove-Item -Force
+          # 3. Remove conflicting server-only files (including mainServer.cpp)
+          Get-ChildItem -Path "src/server" -Include "Player.*", "player.*", "Game.*", "game.*", "Room.*", "Server.*", "server.*", "main.*", "mainServer.*" -Recurse -ErrorAction SilentlyContinue | Remove-Item -Force
 
           # 4. Create UWP WinMain entry point
           $uwpMain = @'
@@ -133,7 +133,7 @@ jobs:
               "dependencies/linmath"
           )
           $allHeaders = Get-ChildItem -Path "src", "dependencies" -Include "*.h", "*.hpp" -Recurse
-          $sourceFiles = Get-ChildItem -Path "src/common", "src/smw", "src/server/platform_enet" -Include "*.cpp", "*.c", "*.h", "*.hpp" -Recurse
+          $sourceFiles = Get-ChildItem -Path "src/common", "src/smw", "src/server" -Include "*.cpp", "*.c", "*.h", "*.hpp" -Recurse
           foreach ($file in $sourceFiles) {
               $content = Get-Content $file.FullName -Raw
               $incMatches = [regex]::Matches($content, '#include\s+"([^"]+)"')
@@ -160,7 +160,7 @@ jobs:
               }
           }
 
-          # 9. Generate CMakeLists.txt compiling only src/server/platform_enet/*.cpp (never mainServer.cpp)
+          # 9. Generate CMakeLists.txt
           $uwpCmake = @'
           cmake_minimum_required(VERSION 3.16)
           project(SuperMarioWar LANGUAGES C CXX)
@@ -182,8 +182,8 @@ jobs:
           file(GLOB_RECURSE COMMON_SOURCES
               "src/common/*.cpp"
               "src/common/*.c"
-              "src/server/platform_enet/*.cpp"
-              "src/server/platform_enet/*.c"
+              "src/server/*.cpp"
+              "src/server/*.c"
               "dependencies/findfirst/*.c"
               "dependencies/Simpleini/*.c"
               "dependencies/Simpleini/*.cpp"
@@ -220,7 +220,6 @@ jobs:
               "src/smw/platform/network"
               "src/smw/platform/network/enet"
               "src/server"
-              "src/server/platform_enet"
               "dependencies"
               "dependencies/enet/include"
               "dependencies/findfirst"
