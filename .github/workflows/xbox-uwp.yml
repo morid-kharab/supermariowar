@@ -1,0 +1,253 @@
+name: Build Super Mario War Xbox UWP
+
+on:
+  push:
+    paths:
+      - '.github/workflows/xbox-uwp.yml'
+  workflow_dispatch:
+
+jobs:
+  build-xbox-uwp:
+    runs-on: windows-2022
+
+    steps:
+      - name: Clone Super Mario War (sdl2 branch)
+        shell: pwsh
+        run: |
+          git clone --recursive --branch sdl2 https://github.com/mmatyas/supermariowar.git smw-uwp
+
+      - name: Cache vcpkg UWP binaries
+        uses: actions/cache@v4
+        with:
+          path: |
+            C:/vcpkg/installed
+            ${{ env.LOCALAPPDATA }}/vcpkg/archives
+          key: vcpkg-smw-x64-uwp-v1
+
+      - name: Install x64-uwp Dependencies via vcpkg
+        shell: pwsh
+        run: |
+          vcpkg install sdl2:x64-uwp sdl2-image[libpng]:x64-uwp sdl2-mixer:x64-uwp zlib:x64-uwp yaml-cpp:x64-uwp
+
+      - name: Patch Source Code for Xbox UWP & Full Controller Customization
+        shell: pwsh
+        working-directory: smw-uwp
+        run: |
+          # 1. Create UWP WinMain entry point
+          $uwpMain = @'
+          #include <SDL.h>
+          #include <SDL_main.h>
+          #include <windows.h>
+
+          int CALLBACK WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
+              SDL_SetHint(SDL_HINT_WINRT_HANDLE_BACK_BUTTON, "1");
+              SDL_SetHint(SDL_HINT_RENDER_DRIVER, "direct3d11");
+              SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
+              return SDL_WinRTRunApp(SDL_main, NULL);
+          }
+          '@
+          Set-Content -Path "src/smw/uwp_main.cpp" -Value $uwpMain -Encoding UTF8
+
+          # 2. Ensure main.cpp includes SDL_main.h and initializes GameController/Joystick subsystems
+          $mainCpp = Get-Content "src/smw/main.cpp" -Raw
+          if ($mainCpp -notmatch "SDL_main\.h") {
+              $mainCpp = "#include `"SDL_main.h`"`n" + $mainCpp
+          }
+          $mainCpp = $mainCpp -replace "SDL_INIT_VIDEO", "(SDL_INIT_VIDEO | SDL_INIT_JOYSTICK | SDL_INIT_GAMECONTROLLER)"
+          Set-Content -Path "src/smw/main.cpp" -Value $mainCpp -Encoding UTF8
+
+          # 3. Patch src/common/path.cpp so saves/options write to Xbox UWP LocalState and data reads from Package Root
+          $pathCpp = Get-Content "src/common/path.cpp" -Raw
+          if ($pathCpp -notmatch "SDL_filesystem\.h") {
+              $pathCpp = "#include `"SDL_filesystem.h`"`n" + $pathCpp
+          }
+          $uwpHomePatch = @'
+          std::string GetHomeDirectory()
+          {
+              char* prefPath = SDL_GetPrefPath("72dpiarmy", "supermariowar");
+              if (prefPath) {
+                  std::string result(prefPath);
+                  SDL_free(prefPath);
+                  return result;
+              }
+              return "./";
+          }
+          std::string GetDesktopHomeDirectory_Unused()
+          '@
+          $pathCpp = $pathCpp -replace "std::string GetHomeDirectory\(\)", $uwpHomePatch
+          Set-Content -Path "src/common/path.cpp" -Value $pathCpp -Encoding UTF8
+
+          # 4. Patch CMakeLists.txt to build only the smw game target as a WIN32 UWP executable linked to vcpkg
+          $uwpCmake = @'
+          cmake_minimum_required(VERSION 3.16)
+          project(SuperMarioWar LANGUAGES C CXX)
+
+          set(CMAKE_CXX_STANDARD 17)
+          set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+          find_package(ZLIB REQUIRED)
+          find_package(SDL2 CONFIG REQUIRED)
+          find_package(SDL2_image CONFIG REQUIRED)
+          find_package(SDL2_mixer CONFIG REQUIRED)
+          find_package(yaml-cpp CONFIG REQUIRED)
+
+          file(GLOB_RECURSE COMMON_SOURCES
+              "src/common/*.cpp"
+              "src/common/*.c"
+              "dependencies/findfirst/*.c"
+              "dependencies/Simpleini/*.c"
+          )
+
+          file(GLOB_RECURSE SMW_SOURCES
+              "src/smw/*.cpp"
+              "src/smw/*.c"
+          )
+
+          # Exclude netplay if ENet is disabled so UWP winsock partition rules are not violated
+          add_compile_definitions(
+              NETWORK_DISABLED
+              PREFIXPATH=""
+              _CRT_SECURE_NO_WARNINGS
+              NOMINMAX
+          )
+
+          add_executable(smw WIN32 ${COMMON_SOURCES} ${SMW_SOURCES})
+
+          target_include_directories(smw PRIVATE
+              "src/common"
+              "src/smw"
+              "dependencies"
+              "dependencies/findfirst"
+              "dependencies/Simpleini"
+              "${CMAKE_BINARY_DIR}"
+          )
+
+          # Generate build/version.h if expected by source
+          file(WRITE "${CMAKE_BINARY_DIR}/version.h" "#pragma once\n#define GIT_REVISION \"xbox-uwp\"\n")
+
+          target_link_libraries(smw PRIVATE
+              SDL2::SDL2
+              $<IF:$<TARGET_EXISTS:SDL2_image::SDL2_image>,SDL2_image::SDL2_image,SDL2_image::SDL2_image-static>
+              $<IF:$<TARGET_EXISTS:SDL2_mixer::SDL2_mixer>,SDL2_mixer::SDL2_mixer,SDL2_mixer::SDL2_mixer-static>
+              ZLIB::ZLIB
+              yaml-cpp
+              d3d11
+              dxgi
+              dxguid
+              winmm
+          )
+          '@
+          Set-Content -Path "CMakeLists.txt" -Value $uwpCmake -Encoding UTF8
+
+      - name: Configure and Compile UWP Executable
+        shell: pwsh
+        working-directory: smw-uwp
+        run: |
+          cmake -B build-uwp -G "Visual Studio 17 2022" -A x64 `
+            -DCMAKE_SYSTEM_NAME=WindowsStore `
+            -DCMAKE_SYSTEM_VERSION=10.0 `
+            -DCMAKE_TOOLCHAIN_FILE="C:/vcpkg/scripts/buildsystems/vcpkg.cmake" `
+            -DVCPKG_TARGET_TRIPLET=x64-uwp
+
+          cmake --build build-uwp --config Release --target smw
+
+      - name: Stage, Pack, and Sign Xbox UWP (.msix) Package
+        shell: pwsh
+        working-directory: smw-uwp
+        run: |
+          New-Item -ItemType Directory -Force -Path "AppxStage/Assets" | Out-Null
+          New-Item -ItemType Directory -Force -Path "ArtifactOut" | Out-Null
+
+          # Copy compiled smw.exe and vcpkg UWP runtime DLLs
+          $exePath = Get-ChildItem -Path "build-uwp" -Filter "smw.exe" -Recurse | Select-Object -First 1
+          Copy-Item $exePath.FullName -Destination "AppxStage/smw.exe"
+          Copy-Item "C:/vcpkg/installed/x64-uwp/bin/*.dll" -Destination "AppxStage/" -ErrorAction SilentlyContinue
+
+          # Copy Super Mario War data/ contents to package root
+          Copy-Item "data/*" -Destination "AppxStage/" -Recurse -Force
+
+          # Generate valid UWP tile PNGs
+          Add-Type -AssemblyName System.Drawing
+          function Make-Png($path, $w, $h) {
+              $bmp = New-Object System.Drawing.Bitmap($w, $h)
+              $g = [System.Drawing.Graphics]::FromImage($bmp)
+              $g.Clear([System.Drawing.Color]::FromArgb(255, 220, 40, 40))
+              $g.Dispose()
+              $bmp.Save($path, [System.Drawing.Imaging.ImageFormat]::Png)
+              $bmp.Dispose()
+          }
+          Make-Png "AppxStage/Assets/Square150x150Logo.png" 150 150
+          Make-Png "AppxStage/Assets/Square44x44Logo.png" 44 44
+          Make-Png "AppxStage/Assets/Wide310x150Logo.png" 310 150
+          Make-Png "AppxStage/Assets/SplashScreen.png" 620 300
+          Make-Png "AppxStage/Assets/StoreLogo.png" 50 50
+
+          # Create Xbox-compatible AppxManifest.xml
+          $manifest = @'
+          <?xml version="1.0" encoding="utf-8"?>
+          <Package xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
+                   xmlns:mp="http://schemas.microsoft.com/appx/2014/phone/manifest"
+                   xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
+                   IgnorableNamespaces="uap mp">
+            <Identity Name="72dpiarmy.SuperMarioWar"
+                      Publisher="CN=SuperMarioWarDev"
+                      Version="2.0.0.0"
+                      ProcessorArchitecture="x64" />
+            <mp:PhoneIdentity PhoneProductId="a1b2c3d4-e5f6-4a5b-8c9d-0e1f2a3b4c5d" PhonePublisherId="00000000-0000-0000-0000-000000000000"/>
+            <Properties>
+              <DisplayName>Super Mario War</DisplayName>
+              <PublisherDisplayName>72dpiarmy</PublisherDisplayName>
+              <Logo>Assets\StoreLogo.png</Logo>
+            </Properties>
+            <Dependencies>
+              <TargetDeviceFamily Name="Windows.Universal" MinVersion="10.0.17763.0" MaxVersionTested="10.0.22621.0" />
+              <TargetDeviceFamily Name="Windows.Xbox" MinVersion="10.0.17763.0" MaxVersionTested="10.0.22621.0" />
+              <PackageDependency Name="Microsoft.VCLibs.140.00" MinVersion="14.0.0.0" Publisher="CN=Microsoft Corporation, O=Microsoft Corporation, L=Redmond, S=Washington, C=US" />
+            </Dependencies>
+            <Resources>
+              <Resource Language="en-US"/>
+            </Resources>
+            <Applications>
+              <Application Id="App" Executable="smw.exe" EntryPoint="SuperMarioWar.App">
+                <uap:VisualElements DisplayName="Super Mario War"
+                                    Square150x150Logo="Assets\Square150x150Logo.png"
+                                    Square44x44Logo="Assets\Square44x44Logo.png"
+                                    Description="Super Mario War Xbox UWP Port"
+                                    BackgroundColor="#dc2828">
+                  <uap:DefaultTile Wide310x150Logo="Assets\Wide310x150Logo.png" />
+                  <uap:SplashScreen Image="Assets\SplashScreen.png" />
+                </uap:VisualElements>
+              </Application>
+            </Applications>
+            <Capabilities>
+              <Capability Name="internetClient" />
+            </Capabilities>
+          </Package>
+          '@
+          Set-Content -Path "AppxStage/AppxManifest.xml" -Value $manifest -Encoding UTF8
+
+          # Locate Windows SDK MakeAppx and SignTool
+          $sdkBin = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin\10.*\x64" | Sort-Object Name -Descending | Select-Object -First 1
+          $makeAppx = Join-Path $sdkBin.FullName "makeappx.exe"
+          $signTool = Join-Path $sdkBin.FullName "signtool.exe"
+
+          # Pack .msix
+          & $makeAppx pack /d "AppxStage" /p "ArtifactOut/SuperMarioWar-Xbox-x64.msix" /nv
+
+          # Create self-signed certificate and sign the .msix package
+          $cert = New-SelfSignedCertificate -Type Custom -Subject "CN=SuperMarioWarDev" -KeyUsage DigitalSignature -FriendlyName "SMW Xbox Cert" -CertStoreLocation "Cert:\CurrentUser\My" -TextExtension @("2.5.29.37={text}1.3.6.1.5.5.7.3.3", "2.5.29.19={text}")
+          $pwd = ConvertTo-SecureString -String "smw123" -Force -AsPlainText
+          Export-PfxCertificate -Cert $cert -FilePath "ArtifactOut/smw_cert.pfx" -Password $pwd | Out-Null
+          & $signTool sign /fd SHA256 /a /f "ArtifactOut/smw_cert.pfx" /p "smw123" "ArtifactOut/SuperMarioWar-Xbox-x64.msix"
+
+          # Include VCLibs x64 dependency for Xbox Device Portal
+          $vcLibs = Get-ChildItem "C:\Program Files (x86)\Microsoft SDKs\Windows Kits\10\ExtensionSDKs\Microsoft.VCLibs\14.0\Appx\Retail\x64\Microsoft.VCLibs.x64.14.00.appx" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($vcLibs) {
+              Copy-Item $vcLibs.FullName -Destination "ArtifactOut/"
+          }
+
+      - name: Upload Xbox UWP Package Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: SuperMarioWar-Xbox-UWP
+          path: smw-uwp/ArtifactOut/*
