@@ -40,6 +40,8 @@ jobs:
           #include <SDL_main.h>
           #include <windows.h>
 
+          extern "C" int SDL_main(int argc, char *argv[]);
+
           int CALLBACK WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
               SDL_SetHint(SDL_HINT_WINRT_HANDLE_BACK_BUTTON, "1");
               SDL_SetHint(SDL_HINT_RENDER_DRIVER, "direct3d11");
@@ -49,12 +51,13 @@ jobs:
           '@
           Set-Content -Path "src/smw/uwp_main.cpp" -Value $uwpMain -Encoding UTF8
 
-          # 2. Ensure main.cpp includes SDL_main.h and initializes GameController/Joystick subsystems
+          # 2. Ensure main.cpp exports SDL_main and initializes GameController/Joystick subsystems
           $mainCpp = Get-Content "src/smw/main.cpp" -Raw
           if ($mainCpp -notmatch "SDL_main\.h") {
               $mainCpp = "#include `"SDL_main.h`"`n" + $mainCpp
           }
           $mainCpp = $mainCpp -replace "SDL_INIT_VIDEO", "(SDL_INIT_VIDEO | SDL_INIT_JOYSTICK | SDL_INIT_GAMECONTROLLER)"
+          $mainCpp = $mainCpp -replace "int\s+main\s*\(", "#undef main`nextern `"C`" int SDL_main("
           Set-Content -Path "src/smw/main.cpp" -Value $mainCpp -Encoding UTF8
 
           # 3. Fix CreateDirectoryA in src/common/Game.cpp for UWP
@@ -95,26 +98,17 @@ jobs:
           $pathCpp = $pathCpp -replace "std::string GetHomeDirectory\(\)", $uwpHomePatch
           Set-Content -Path "src/common/path.cpp" -Value $pathCpp -Encoding UTF8
 
-          # 5. Patch ENet win32.c timer functions for UWP partition compatibility
+          # 5. Patch ENet win32.c timer calls directly so UWP partition rules are not violated
           Get-ChildItem -Path "dependencies" -Filter "win32.c" -Recurse | ForEach-Object {
               $win32c = Get-Content $_.FullName -Raw
-              $uwpTimerStub = @'
-          #include <windows.h>
-          #define timeBeginPeriod(x) 0
-          #define timeEndPeriod(x) 0
-          #define timeGetTime() ((unsigned long)GetTickCount64())
-          '@
-              Set-Content -Path $_.FullName -Value ($uwpTimerStub + "`n" + $win32c) -Encoding UTF8
+              $win32c = $win32c -replace "timeBeginPeriod\s*\([^)]+\)\s*;", "/* timeBeginPeriod */"
+              $win32c = $win32c -replace "timeEndPeriod\s*\([^)]+\)\s*;", "/* timeEndPeriod */"
+              $win32c = $win32c -replace "timeGetTime\s*\(\s*\)", "((enet_uint32)GetTickCount64())"
+              Set-Content -Path $_.FullName -Value $win32c -Encoding UTF8
           }
 
-          # 6. Collect all header directories in src/ and dependencies/ automatically
-          $headerDirs = Get-ChildItem -Path "src", "dependencies" -Include "*.h", "*.hpp" -Recurse |
-              Select-Object -ExpandProperty DirectoryName -Unique |
-              ForEach-Object { "    `"" + ($_ -replace '\\', '/') + "`"" }
-          $headerDirsBlock = $headerDirs -join "`n"
-
-          # 7. Generate CMakeLists.txt (preserving src/common/Version.h and excluding MenuTemplate.cpp)
-          $uwpCmake = @"
+          # 6. Generate CMakeLists.txt with explicit include paths (never including src/server)
+          $uwpCmake = @'
           cmake_minimum_required(VERSION 3.16)
           project(SuperMarioWar LANGUAGES C CXX)
 
@@ -135,7 +129,6 @@ jobs:
           file(GLOB_RECURSE COMMON_SOURCES
               "src/common/*.cpp"
               "src/common/*.c"
-              "dependencies/findfirst/*.c"
               "dependencies/Simpleini/*.c"
               "dependencies/sha1/*.c"
               "dependencies/sha1/*.cpp"
@@ -152,6 +145,7 @@ jobs:
           add_compile_definitions(
               PREFIXPATH=""
               GIT_REVISION="xbox-uwp"
+              GIT_DATE="2026-11-16"
               _CRT_SECURE_NO_WARNINGS
               _WINSOCK_DEPRECATED_NO_WARNINGS
               _SILENCE_ALL_CXX17_DEPRECATION_WARNINGS
@@ -159,27 +153,35 @@ jobs:
               NOMINMAX
           )
 
-          add_executable(smw WIN32 `${COMMON_SOURCES} `${SMW_SOURCES})
+          add_executable(smw WIN32 ${COMMON_SOURCES} ${SMW_SOURCES})
 
           target_include_directories(smw PRIVATE
-          $headerDirsBlock
-              "`${CMAKE_BINARY_DIR}"
+              "src/common"
+              "src/smw"
+              "src/smw/platform/network"
+              "dependencies"
+              "dependencies/enet/include"
+              "dependencies/findfirst"
+              "dependencies/Simpleini"
+              "dependencies/sha1"
+              "dependencies/linmath"
+              "${CMAKE_BINARY_DIR}"
           )
 
           target_link_libraries(smw PRIVATE
               SDL2::SDL2
-              `$<IF:`$<TARGET_EXISTS:SDL2_image::SDL2_image>,SDL2_image::SDL2_image,SDL2_image::SDL2_image-static>
-              `$<IF:`$<TARGET_EXISTS:SDL2_mixer::SDL2_mixer>,SDL2_mixer::SDL2_mixer,SDL2_mixer::SDL2_mixer-static>
+              $<IF:$<TARGET_EXISTS:SDL2_image::SDL2_image>,SDL2_image::SDL2_image,SDL2_image::SDL2_image-static>
+              $<IF:$<TARGET_EXISTS:SDL2_mixer::SDL2_mixer>,SDL2_mixer::SDL2_mixer,SDL2_mixer::SDL2_mixer-static>
               ZLIB::ZLIB
-              `$<IF:`$<TARGET_EXISTS:yaml-cpp::yaml-cpp>,yaml-cpp::yaml-cpp,yaml-cpp>
+              $<IF:$<TARGET_EXISTS:yaml-cpp::yaml-cpp>,yaml-cpp::yaml-cpp,yaml-cpp>
               d3d11
               dxgi
               dxguid
-              winmm
               ws2_32
               iphlpapi
+              WindowsApp
           )
-          "@
+          '@
           Set-Content -Path "CMakeLists.txt" -Value $uwpCmake -Encoding UTF8
 
       - name: Configure and Compile UWP Executable
