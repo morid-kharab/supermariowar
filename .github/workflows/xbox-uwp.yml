@@ -22,13 +22,13 @@ jobs:
           path: |
             C:/vcpkg/installed
             C:/Users/runneradmin/AppData/Local/vcpkg/archives
-          key: vcpkg-smw-x64-uwp-v2
+          key: vcpkg-smw-x64-uwp-v3
 
       - name: Install x64-uwp Dependencies via vcpkg
         shell: pwsh
         run: |
           $vcpkgExe = Join-Path $env:VCPKG_INSTALLATION_ROOT "vcpkg.exe"
-          & $vcpkgExe install sdl2:x64-uwp sdl2-image:x64-uwp sdl2-mixer:x64-uwp zlib:x64-uwp yaml-cpp:x64-uwp --triplet x64-uwp
+          & $vcpkgExe install sdl2:x64-uwp sdl2-image:x64-uwp sdl2-mixer:x64-uwp zlib:x64-uwp yaml-cpp:x64-uwp toml11:x64-uwp --triplet x64-uwp
 
       - name: Patch Source Code for Xbox UWP & Full Controller Customization
         shell: pwsh
@@ -85,36 +85,45 @@ jobs:
           '@
           Set-Content -Path "src/common/version.h" -Value $versionHeader -Encoding UTF8
 
-          # 5. Patch CMakeLists.txt to build the smw UWP executable
+          # 5. Patch CMakeLists.txt with C++20 enabled and warning spam suppressed (/W0)
           $uwpCmake = @'
           cmake_minimum_required(VERSION 3.16)
           project(SuperMarioWar LANGUAGES C CXX)
 
-          set(CMAKE_CXX_STANDARD 17)
+          set(CMAKE_CXX_STANDARD 20)
           set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+          if(MSVC)
+              add_compile_options(/W0 /Zc:__cplusplus /utf-8 /EHsc)
+          endif()
 
           find_package(ZLIB REQUIRED)
           find_package(SDL2 CONFIG REQUIRED)
           find_package(SDL2_image CONFIG REQUIRED)
           find_package(SDL2_mixer CONFIG REQUIRED)
           find_package(yaml-cpp CONFIG REQUIRED)
+          find_package(toml11 CONFIG QUIET)
 
           file(GLOB_RECURSE COMMON_SOURCES
               "src/common/*.cpp"
               "src/common/*.c"
-              "dependencies/findfirst/*.c"
-              "dependencies/Simpleini/*.c"
+              "dependencies/*.c"
+              "dependencies/*.cpp"
           )
+          list(FILTER COMMON_SOURCES EXCLUDE REGEX "dependencies/(doctest|enet|SDL|zlib|yaml-cpp|toml11)/.*")
 
           file(GLOB_RECURSE SMW_SOURCES
               "src/smw/*.cpp"
               "src/smw/*.c"
           )
+          list(FILTER SMW_SOURCES EXCLUDE REGEX "src/smw/network/.*")
 
           add_compile_definitions(
               NETWORK_DISABLED
               PREFIXPATH=""
               _CRT_SECURE_NO_WARNINGS
+              _SILENCE_ALL_CXX17_DEPRECATION_WARNINGS
+              _SILENCE_ALL_CXX20_DEPRECATION_WARNINGS
               NOMINMAX
           )
 
@@ -126,6 +135,8 @@ jobs:
               "dependencies"
               "dependencies/findfirst"
               "dependencies/Simpleini"
+              "dependencies/sha1"
+              "dependencies/linmath"
               "${CMAKE_BINARY_DIR}"
           )
 
@@ -161,8 +172,13 @@ jobs:
           & cmake @cmakeArgs
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-          & cmake --build build-uwp --config Release --target smw
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & cmake --build build-uwp --config Release --target smw | Tee-Object -FilePath build.log
+          if ($LASTEXITCODE -ne 0) {
+              Write-Host "`n================ UNIQUE BUILD ERRORS ================" -ForegroundColor Red
+              Select-String -Path build.log -Pattern ": error |fatal error |LNK[0-9]+:" | ForEach-Object { $_.Line.Trim() } | Select-Object -Unique | ForEach-Object { Write-Host $_ -ForegroundColor Red }
+              Write-Host "=====================================================" -ForegroundColor Red
+              exit 1
+          }
 
       - name: Stage, Pack, and Sign Xbox UWP (.msix) Package
         shell: pwsh
