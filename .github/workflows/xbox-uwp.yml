@@ -57,7 +57,12 @@ jobs:
           $mainCpp = $mainCpp -replace "SDL_INIT_VIDEO", "(SDL_INIT_VIDEO | SDL_INIT_JOYSTICK | SDL_INIT_GAMECONTROLLER)"
           Set-Content -Path "src/smw/main.cpp" -Value $mainCpp -Encoding UTF8
 
-          # 3. Patch src/common/path.cpp so saves/options write to Xbox UWP LocalState
+          # 3. Fix CreateDirectoryA in src/common/Game.cpp for UWP
+          $gameCpp = Get-Content "src/common/Game.cpp" -Raw
+          $gameCpp = $gameCpp -replace "\bCreateDirectory\s*\(", "CreateDirectoryA("
+          Set-Content -Path "src/common/Game.cpp" -Value $gameCpp -Encoding UTF8
+
+          # 4. Patch src/common/path.cpp so saves/options write to Xbox UWP LocalState and stub out legacy SHGetFolderPathA
           $pathCpp = Get-Content "src/common/path.cpp" -Raw
           if ($pathCpp -notmatch "SDL_filesystem\.h") {
               $pathCpp = "#include `"SDL_filesystem.h`"`n" + $pathCpp
@@ -73,20 +78,43 @@ jobs:
               }
               return "./";
           }
+          #ifndef MAX_PATH
+          #define MAX_PATH 260
+          #endif
+          #ifndef CSIDL_PROFILE
+          #define CSIDL_PROFILE 0x0028
+          #endif
+          #ifndef S_OK
+          #define S_OK 0
+          #endif
+          #ifndef SHGetFolderPathA
+          #define SHGetFolderPathA(a,b,c,d,e) (-1)
+          #endif
           std::string GetDesktopHomeDirectory_Unused()
           '@
           $pathCpp = $pathCpp -replace "std::string GetHomeDirectory\(\)", $uwpHomePatch
           Set-Content -Path "src/common/path.cpp" -Value $pathCpp -Encoding UTF8
 
-          # 4. Write version.h directly to src/common/version.h
-          $versionHeader = @'
-          #pragma once
-          #define GIT_REVISION "xbox-uwp"
+          # 5. Patch ENet win32.c timer functions for UWP partition compatibility
+          Get-ChildItem -Path "dependencies" -Filter "win32.c" -Recurse | ForEach-Object {
+              $win32c = Get-Content $_.FullName -Raw
+              $uwpTimerStub = @'
+          #include <windows.h>
+          #define timeBeginPeriod(x) 0
+          #define timeEndPeriod(x) 0
+          #define timeGetTime() ((unsigned long)GetTickCount64())
           '@
-          Set-Content -Path "src/common/version.h" -Value $versionHeader -Encoding UTF8
+              Set-Content -Path $_.FullName -Value ($uwpTimerStub + "`n" + $win32c) -Encoding UTF8
+          }
 
-          # 5. Patch CMakeLists.txt with C++20 enabled and warning spam suppressed (/W0)
-          $uwpCmake = @'
+          # 6. Collect all header directories in src/ and dependencies/ automatically
+          $headerDirs = Get-ChildItem -Path "src", "dependencies" -Include "*.h", "*.hpp" -Recurse |
+              Select-Object -ExpandProperty DirectoryName -Unique |
+              ForEach-Object { "    `"" + ($_ -replace '\\', '/') + "`"" }
+          $headerDirsBlock = $headerDirs -join "`n"
+
+          # 7. Generate CMakeLists.txt (preserving src/common/Version.h and excluding MenuTemplate.cpp)
+          $uwpCmake = @"
           cmake_minimum_required(VERSION 3.16)
           project(SuperMarioWar LANGUAGES C CXX)
 
@@ -94,7 +122,7 @@ jobs:
           set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
           if(MSVC)
-              add_compile_options(/W0 /Zc:__cplusplus /utf-8 /EHsc)
+              add_compile_options(/W0 /Zc:__cplusplus /utf-8 /EHsc /UUNICODE /U_UNICODE)
           endif()
 
           find_package(ZLIB REQUIRED)
@@ -107,51 +135,51 @@ jobs:
           file(GLOB_RECURSE COMMON_SOURCES
               "src/common/*.cpp"
               "src/common/*.c"
-              "dependencies/*.c"
-              "dependencies/*.cpp"
+              "dependencies/findfirst/*.c"
+              "dependencies/Simpleini/*.c"
+              "dependencies/sha1/*.c"
+              "dependencies/sha1/*.cpp"
+              "dependencies/enet/*.c"
           )
-          list(FILTER COMMON_SOURCES EXCLUDE REGEX "dependencies/(doctest|enet|SDL|zlib|yaml-cpp|toml11)/.*")
+          list(FILTER COMMON_SOURCES EXCLUDE REGEX "unix\\.c$")
 
           file(GLOB_RECURSE SMW_SOURCES
               "src/smw/*.cpp"
               "src/smw/*.c"
           )
-          list(FILTER SMW_SOURCES EXCLUDE REGEX "src/smw/network/.*")
+          list(FILTER SMW_SOURCES EXCLUDE REGEX "MenuTemplate\\.cpp$")
 
           add_compile_definitions(
-              NETWORK_DISABLED
               PREFIXPATH=""
+              GIT_REVISION="xbox-uwp"
               _CRT_SECURE_NO_WARNINGS
+              _WINSOCK_DEPRECATED_NO_WARNINGS
               _SILENCE_ALL_CXX17_DEPRECATION_WARNINGS
               _SILENCE_ALL_CXX20_DEPRECATION_WARNINGS
               NOMINMAX
           )
 
-          add_executable(smw WIN32 ${COMMON_SOURCES} ${SMW_SOURCES})
+          add_executable(smw WIN32 `${COMMON_SOURCES} `${SMW_SOURCES})
 
           target_include_directories(smw PRIVATE
-              "src/common"
-              "src/smw"
-              "dependencies"
-              "dependencies/findfirst"
-              "dependencies/Simpleini"
-              "dependencies/sha1"
-              "dependencies/linmath"
-              "${CMAKE_BINARY_DIR}"
+          $headerDirsBlock
+              "`${CMAKE_BINARY_DIR}"
           )
 
           target_link_libraries(smw PRIVATE
               SDL2::SDL2
-              $<IF:$<TARGET_EXISTS:SDL2_image::SDL2_image>,SDL2_image::SDL2_image,SDL2_image::SDL2_image-static>
-              $<IF:$<TARGET_EXISTS:SDL2_mixer::SDL2_mixer>,SDL2_mixer::SDL2_mixer,SDL2_mixer::SDL2_mixer-static>
+              `$<IF:`$<TARGET_EXISTS:SDL2_image::SDL2_image>,SDL2_image::SDL2_image,SDL2_image::SDL2_image-static>
+              `$<IF:`$<TARGET_EXISTS:SDL2_mixer::SDL2_mixer>,SDL2_mixer::SDL2_mixer,SDL2_mixer::SDL2_mixer-static>
               ZLIB::ZLIB
-              yaml-cpp
+              `$<IF:`$<TARGET_EXISTS:yaml-cpp::yaml-cpp>,yaml-cpp::yaml-cpp,yaml-cpp>
               d3d11
               dxgi
               dxguid
               winmm
+              ws2_32
+              iphlpapi
           )
-          '@
+          "@
           Set-Content -Path "CMakeLists.txt" -Value $uwpCmake -Encoding UTF8
 
       - name: Configure and Compile UWP Executable
