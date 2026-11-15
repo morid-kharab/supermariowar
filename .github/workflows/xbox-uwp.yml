@@ -34,7 +34,33 @@ jobs:
         shell: pwsh
         working-directory: smw-uwp
         run: |
-          # 1. Create UWP WinMain entry point
+          # 1. Fetch ENet into dependencies/enet if not bundled in the repo
+          if (-not (Test-Path "dependencies/enet/include/enet/enet.h")) {
+              if (Test-Path "dependencies/enet") { Remove-Item "dependencies/enet" -Recurse -Force }
+              git clone --depth 1 https://github.com/lsalzman/enet.git dependencies/enet
+          }
+
+          # 2. Patch ENet win32.c timer calls so UWP partition rules are not violated
+          Get-ChildItem -Path "dependencies/enet" -Filter "win32.c" -Recurse | ForEach-Object {
+              $win32c = Get-Content $_.FullName -Raw
+              $win32c = $win32c -replace "timeBeginPeriod\s*\([^)]+\)\s*;", "/* timeBeginPeriod */"
+              $win32c = $win32c -replace "timeEndPeriod\s*\([^)]+\)\s*;", "/* timeEndPeriod */"
+              $win32c = $win32c -replace "timeGetTime\s*\(\s*\)", "((enet_uint32)GetTickCount64())"
+              Set-Content -Path $_.FullName -Value $win32c -Encoding UTF8
+          }
+
+          # 3. Copy shared protocol/network headers (like ProtocolDefinitions.h) into src/smw/network
+          # while strictly skipping conflicting server headers (Player.h, Game.h, etc.)
+          Get-ChildItem -Path "src" -Include "*.h", "*.hpp" -Recurse | Where-Object {
+              $_.Name -notin @("Player.h", "player.h", "Game.h", "game.h", "Room.h", "Server.h")
+          } | ForEach-Object {
+              $dest = Join-Path "src/smw/network" $_.Name
+              if (-not (Test-Path $dest)) {
+                  Copy-Item $_.FullName -Destination $dest -Force
+              }
+          }
+
+          # 4. Create UWP WinMain entry point
           $uwpMain = @'
           #include <SDL.h>
           #include <SDL_main.h>
@@ -51,7 +77,7 @@ jobs:
           '@
           Set-Content -Path "src/smw/uwp_main.cpp" -Value $uwpMain -Encoding UTF8
 
-          # 2. Ensure main.cpp exports SDL_main and initializes GameController/Joystick subsystems
+          # 5. Ensure main.cpp exports SDL_main and initializes GameController/Joystick subsystems
           $mainCpp = Get-Content "src/smw/main.cpp" -Raw
           if ($mainCpp -notmatch "SDL_main\.h") {
               $mainCpp = "#include `"SDL_main.h`"`n" + $mainCpp
@@ -60,12 +86,12 @@ jobs:
           $mainCpp = $mainCpp -replace "int\s+main\s*\(", "#undef main`nextern `"C`" int SDL_main("
           Set-Content -Path "src/smw/main.cpp" -Value $mainCpp -Encoding UTF8
 
-          # 3. Fix CreateDirectoryA in src/common/Game.cpp for UWP
+          # 6. Fix CreateDirectoryA in src/common/Game.cpp for UWP
           $gameCpp = Get-Content "src/common/Game.cpp" -Raw
           $gameCpp = $gameCpp -replace "\bCreateDirectory\s*\(", "CreateDirectoryA("
           Set-Content -Path "src/common/Game.cpp" -Value $gameCpp -Encoding UTF8
 
-          # 4. Patch src/common/path.cpp so saves/options write to Xbox UWP LocalState and stub out legacy SHGetFolderPathA
+          # 7. Patch src/common/path.cpp so saves/options write to Xbox UWP LocalState and stub out legacy SHGetFolderPathA
           $pathCpp = Get-Content "src/common/path.cpp" -Raw
           if ($pathCpp -notmatch "SDL_filesystem\.h") {
               $pathCpp = "#include `"SDL_filesystem.h`"`n" + $pathCpp
@@ -98,23 +124,7 @@ jobs:
           $pathCpp = $pathCpp -replace "std::string GetHomeDirectory\(\)", $uwpHomePatch
           Set-Content -Path "src/common/path.cpp" -Value $pathCpp -Encoding UTF8
 
-          # 5. Patch ENet win32.c timer calls directly so UWP partition rules are not violated
-          Get-ChildItem -Path "dependencies" -Filter "win32.c" -Recurse | ForEach-Object {
-              $win32c = Get-Content $_.FullName -Raw
-              $win32c = $win32c -replace "timeBeginPeriod\s*\([^)]+\)\s*;", "/* timeBeginPeriod */"
-              $win32c = $win32c -replace "timeEndPeriod\s*\([^)]+\)\s*;", "/* timeEndPeriod */"
-              $win32c = $win32c -replace "timeGetTime\s*\(\s*\)", "((enet_uint32)GetTickCount64())"
-              Set-Content -Path $_.FullName -Value $win32c -Encoding UTF8
-          }
-
-          # 6. Ensure NetworkInterface.h is directly reachable in src/smw/network
-          Get-ChildItem -Path "src", "dependencies" -Filter "NetworkInterface.h" -Recurse | Select-Object -First 1 | ForEach-Object {
-              if ($_.DirectoryName -ne (Resolve-Path "src/smw/network").Path) {
-                  Copy-Item $_.FullName -Destination "src/smw/network/NetworkInterface.h" -Force
-              }
-          }
-
-          # 7. Generate CMakeLists.txt with src/smw/network and src/smw/platform/network/enet included
+          # 8. Generate CMakeLists.txt
           $uwpCmake = @'
           cmake_minimum_required(VERSION 3.16)
           project(SuperMarioWar LANGUAGES C CXX)
