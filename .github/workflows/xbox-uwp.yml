@@ -107,7 +107,14 @@ jobs:
               Set-Content -Path $_.FullName -Value $win32c -Encoding UTF8
           }
 
-          # 6. Generate CMakeLists.txt with explicit include paths (never including src/server)
+          # 6. Ensure NetworkInterface.h is directly reachable in src/smw/network
+          Get-ChildItem -Path "src", "dependencies" -Filter "NetworkInterface.h" -Recurse | Select-Object -First 1 | ForEach-Object {
+              if ($_.DirectoryName -ne (Resolve-Path "src/smw/network").Path) {
+                  Copy-Item $_.FullName -Destination "src/smw/network/NetworkInterface.h" -Force
+              }
+          }
+
+          # 7. Generate CMakeLists.txt with src/smw/network and src/smw/platform/network/enet included
           $uwpCmake = @'
           cmake_minimum_required(VERSION 3.16)
           project(SuperMarioWar LANGUAGES C CXX)
@@ -129,7 +136,9 @@ jobs:
           file(GLOB_RECURSE COMMON_SOURCES
               "src/common/*.cpp"
               "src/common/*.c"
+              "dependencies/findfirst/*.c"
               "dependencies/Simpleini/*.c"
+              "dependencies/Simpleini/*.cpp"
               "dependencies/sha1/*.c"
               "dependencies/sha1/*.cpp"
               "dependencies/enet/*.c"
@@ -158,7 +167,10 @@ jobs:
           target_include_directories(smw PRIVATE
               "src/common"
               "src/smw"
+              "src/smw/network"
+              "src/smw/platform"
               "src/smw/platform/network"
+              "src/smw/platform/network/enet"
               "dependencies"
               "dependencies/enet/include"
               "dependencies/findfirst"
@@ -258,7 +270,6 @@ jobs:
             </Properties>
             <Dependencies>
               <TargetDeviceFamily Name="Windows.Universal" MinVersion="10.0.17763.0" MaxVersionTested="10.0.22621.0" />
-              <TargetDeviceFamily Name="Windows.Xbox" MinVersion="10.0.17763.0" MaxVersionTested="10.0.22621.0" />
               <PackageDependency Name="Microsoft.VCLibs.140.00" MinVersion="14.0.0.0" Publisher="CN=Microsoft Corporation, O=Microsoft Corporation, L=Redmond, S=Washington, C=US" />
             </Dependencies>
             <Resources>
@@ -292,7 +303,7 @@ jobs:
           $cert = New-SelfSignedCertificate -Type Custom -Subject "CN=SuperMarioWarDev" -KeyUsage DigitalSignature -FriendlyName "SMW Xbox Cert" -CertStoreLocation "Cert:\CurrentUser\My" -TextExtension @("2.5.29.37={text}1.3.6.1.5.5.7.3.3", "2.5.29.19={text}")
           $pwd = ConvertTo-SecureString -String "smw123" -Force -AsPlainText
           Export-PfxCertificate -Cert $cert -FilePath "ArtifactOut/smw_cert.pfx" -Password $pwd | Out-Null
-          & $signTool sign /fd SHA256 /a /f "ArtifactOut/smw_cert.pfx" /p "smw123" "ArtifactOut/SuperMarioWar-Xbox-x64.msix"
+          & $signTool sign /fd SHA256 /f "ArtifactOut/smw_cert.pfx" /p "smw123" "ArtifactOut/SuperMarioWar-Xbox-x64.msix"
 
           $vcLibs = Get-ChildItem "C:\Program Files (x86)\Microsoft SDKs\Windows Kits\10\ExtensionSDKs\Microsoft.VCLibs\14.0\Appx\Retail\x64\Microsoft.VCLibs.x64.14.00.appx" -ErrorAction SilentlyContinue | Select-Object -First 1
           if ($vcLibs) {
