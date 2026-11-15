@@ -49,16 +49,9 @@ jobs:
               Set-Content -Path $_.FullName -Value $win32c -Encoding UTF8
           }
 
-          # 3. Copy shared protocol/network headers (like ProtocolDefinitions.h) into src/smw/network
-          # while strictly skipping conflicting server headers (Player.h, Game.h, etc.)
-          Get-ChildItem -Path "src" -Include "*.h", "*.hpp" -Recurse | Where-Object {
-              $_.Name -notin @("Player.h", "player.h", "Game.h", "game.h", "Room.h", "Server.h")
-          } | ForEach-Object {
-              $dest = Join-Path "src/smw/network" $_.Name
-              if (-not (Test-Path $dest)) {
-                  Copy-Item $_.FullName -Destination $dest -Force
-              }
-          }
+          # 3. Remove conflicting server-only files from src/server so src/server can be safely included
+          #    with its full subfolder structure (such as src/server/platform_enet/NetPeerENet.h)
+          Get-ChildItem -Path "src/server" -Include "Player.*", "player.*", "Game.*", "game.*", "Room.*", "Server.*", "main.*" -Recurse -ErrorAction SilentlyContinue | Remove-Item -Force
 
           # 4. Create UWP WinMain entry point
           $uwpMain = @'
@@ -124,7 +117,51 @@ jobs:
           $pathCpp = $pathCpp -replace "std::string GetHomeDirectory\(\)", $uwpHomePatch
           Set-Content -Path "src/common/path.cpp" -Value $pathCpp -Encoding UTF8
 
-          # 8. Generate CMakeLists.txt
+          # 8. Pre-verify every #include "..." in the codebase and map any missing relative header path automatically
+          $includeBases = @(
+              "src/common",
+              "src/smw",
+              "src/smw/network",
+              "src/smw/platform",
+              "src/smw/platform/network",
+              "src/smw/platform/network/enet",
+              "src/server",
+              "dependencies",
+              "dependencies/enet/include",
+              "dependencies/findfirst",
+              "dependencies/Simpleini",
+              "dependencies/sha1",
+              "dependencies/linmath"
+          )
+          $allHeaders = Get-ChildItem -Path "src", "dependencies" -Include "*.h", "*.hpp" -Recurse
+          $sourceFiles = Get-ChildItem -Path "src/common", "src/smw", "src/server" -Include "*.cpp", "*.c", "*.h", "*.hpp" -Recurse
+          foreach ($file in $sourceFiles) {
+              $content = Get-Content $file.FullName -Raw
+              $incMatches = [regex]::Matches($content, '#include\s+"([^"]+)"')
+              foreach ($m in $incMatches) {
+                  $inc = $m.Groups[1].Value
+                  $resolved = $false
+                  if (Test-Path (Join-Path $file.DirectoryName $inc)) { $resolved = $true }
+                  if (-not $resolved) {
+                      foreach ($base in $includeBases) {
+                          if (Test-Path (Join-Path $base $inc)) { $resolved = $true; break }
+                      }
+                  }
+                  if (-not $resolved) {
+                      $leaf = Split-Path $inc -Leaf
+                      $candidate = $allHeaders | Where-Object { $_.Name -ieq $leaf } | Select-Object -First 1
+                      if ($candidate) {
+                          $destPath = Join-Path "src/smw/network" $inc
+                          $destDir = Split-Path $destPath -Parent
+                          New-Item -ItemType Directory -Force -Path $destDir | Out-Null
+                          Copy-Item $candidate.FullName -Destination $destPath -Force
+                          Write-Host "Mapped missing relative include: $inc -> $destPath"
+                      }
+                  }
+              }
+          }
+
+          # 9. Generate CMakeLists.txt including src/server/platform_enet/*.cpp for linking
           $uwpCmake = @'
           cmake_minimum_required(VERSION 3.16)
           project(SuperMarioWar LANGUAGES C CXX)
@@ -146,6 +183,8 @@ jobs:
           file(GLOB_RECURSE COMMON_SOURCES
               "src/common/*.cpp"
               "src/common/*.c"
+              "src/server/*.cpp"
+              "src/server/*.c"
               "dependencies/findfirst/*.c"
               "dependencies/Simpleini/*.c"
               "dependencies/Simpleini/*.cpp"
@@ -181,6 +220,8 @@ jobs:
               "src/smw/platform"
               "src/smw/platform/network"
               "src/smw/platform/network/enet"
+              "src/server"
+              "src/server/platform_enet"
               "dependencies"
               "dependencies/enet/include"
               "dependencies/findfirst"
@@ -233,13 +274,14 @@ jobs:
           }
 
       - name: Stage, Pack, and Sign Xbox UWP (.msix) Package
-        shell: pwsh
+        shell: powershell
         working-directory: smw-uwp
         run: |
           New-Item -ItemType Directory -Force -Path "AppxStage/Assets" | Out-Null
           New-Item -ItemType Directory -Force -Path "ArtifactOut" | Out-Null
 
           $exePath = Get-ChildItem -Path "build-uwp" -Filter "smw.exe" -Recurse | Select-Object -First 1
+          if (-not $exePath) { throw "smw.exe was not found in build-uwp!" }
           Copy-Item $exePath.FullName -Destination "AppxStage/smw.exe"
 
           $dllDir = Join-Path $env:VCPKG_INSTALLATION_ROOT "installed/x64-uwp/bin/*.dll"
@@ -302,18 +344,21 @@ jobs:
             </Capabilities>
           </Package>
           '@
-          Set-Content -Path "AppxStage/AppxManifest.xml" -Value $manifest -Encoding UTF8
+          $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+          [System.IO.File]::WriteAllText((Join-Path $PWD "AppxStage/AppxManifest.xml"), $manifest.Trim(), $utf8NoBom)
 
           $sdkBin = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin\10.*\x64" | Sort-Object Name -Descending | Select-Object -First 1
           $makeAppx = Join-Path $sdkBin.FullName "makeappx.exe"
           $signTool = Join-Path $sdkBin.FullName "signtool.exe"
 
           & $makeAppx pack /d "AppxStage" /p "ArtifactOut/SuperMarioWar-Xbox-x64.msix" /nv
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
           $cert = New-SelfSignedCertificate -Type Custom -Subject "CN=SuperMarioWarDev" -KeyUsage DigitalSignature -FriendlyName "SMW Xbox Cert" -CertStoreLocation "Cert:\CurrentUser\My" -TextExtension @("2.5.29.37={text}1.3.6.1.5.5.7.3.3", "2.5.29.19={text}")
           $pwd = ConvertTo-SecureString -String "smw123" -Force -AsPlainText
           Export-PfxCertificate -Cert $cert -FilePath "ArtifactOut/smw_cert.pfx" -Password $pwd | Out-Null
           & $signTool sign /fd SHA256 /f "ArtifactOut/smw_cert.pfx" /p "smw123" "ArtifactOut/SuperMarioWar-Xbox-x64.msix"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
           $vcLibs = Get-ChildItem "C:\Program Files (x86)\Microsoft SDKs\Windows Kits\10\ExtensionSDKs\Microsoft.VCLibs\14.0\Appx\Retail\x64\Microsoft.VCLibs.x64.14.00.appx" -ErrorAction SilentlyContinue | Select-Object -First 1
           if ($vcLibs) {
