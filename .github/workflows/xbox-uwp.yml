@@ -78,7 +78,14 @@ jobs:
           $pathCpp = $pathCpp -replace "std::string GetHomeDirectory\(\)", $uwpHomePatch
           Set-Content -Path "src/common/path.cpp" -Value $pathCpp -Encoding UTF8
 
-          # 4. Patch CMakeLists.txt to build the smw UWP executable
+          # 4. Write version.h directly to src/common/version.h
+          $versionHeader = @'
+          #pragma once
+          #define GIT_REVISION "xbox-uwp"
+          '@
+          Set-Content -Path "src/common/version.h" -Value $versionHeader -Encoding UTF8
+
+          # 5. Patch CMakeLists.txt to build the smw UWP executable
           $uwpCmake = @'
           cmake_minimum_required(VERSION 3.16)
           project(SuperMarioWar LANGUAGES C CXX)
@@ -122,8 +129,6 @@ jobs:
               "${CMAKE_BINARY_DIR}"
           )
 
-          file(WRITE "${CMAKE_BINARY_DIR}/version.h" "#pragma once`n#define GIT_REVISION `"xbox-uwp`"`n")
-
           target_link_libraries(smw PRIVATE
               SDL2::SDL2
               $<IF:$<TARGET_EXISTS:SDL2_image::SDL2_image>,SDL2_image::SDL2_image,SDL2_image::SDL2_image-static>
@@ -143,13 +148,21 @@ jobs:
         working-directory: smw-uwp
         run: |
           $toolchain = Join-Path $env:VCPKG_INSTALLATION_ROOT "scripts/buildsystems/vcpkg.cmake"
-          cmake -B build-uwp -G "Visual Studio 17 2022" -A x64 `
-            -DCMAKE_SYSTEM_NAME=WindowsStore `
-            -DCMAKE_SYSTEM_VERSION=10.0 `
-            -DCMAKE_TOOLCHAIN_FILE="$toolchain" `
-            -DVCPKG_TARGET_TRIPLET=x64-uwp
+          $cmakeArgs = @(
+              "-S", ".",
+              "-B", "build-uwp",
+              "-G", "Visual Studio 17 2022",
+              "-A", "x64",
+              "-DCMAKE_SYSTEM_NAME=WindowsStore",
+              "-DCMAKE_SYSTEM_VERSION=10.0",
+              "-DCMAKE_TOOLCHAIN_FILE=$toolchain",
+              "-DVCPKG_TARGET_TRIPLET=x64-uwp"
+          )
+          & cmake @cmakeArgs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-          cmake --build build-uwp --config Release --target smw
+          & cmake --build build-uwp --config Release --target smw
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Stage, Pack, and Sign Xbox UWP (.msix) Package
         shell: pwsh
