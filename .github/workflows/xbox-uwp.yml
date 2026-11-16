@@ -133,7 +133,25 @@ jobs:
 
           extern "C" int SDL_main(int argc, char *argv[]);
 
+          // Fix FPS: set 1ms timer resolution via NtSetTimerResolution (available in UWP,
+          // unlike timeBeginPeriod which is Desktop-only). Without this SDL_Delay() uses
+          // the default ~15ms Sleep() granularity, causing the game to drop ~8-9 fps below
+          // its target (e.g. 53-57 fps instead of 62 fps).
+          static void SetHighResolutionTimer() {
+              typedef LONG(NTAPI* NtSetTimerResolutionFn)(ULONG, BOOLEAN, PULONG);
+              HMODULE ntdll = LoadLibraryW(L"ntdll.dll");
+              if (ntdll) {
+                  auto fn = (NtSetTimerResolutionFn)GetProcAddress(ntdll, "NtSetTimerResolution");
+                  if (fn) {
+                      ULONG actual = 0;
+                      fn(10000, TRUE, &actual); // 10000 x 100ns = 1ms
+                  }
+              }
+          }
+
           int CALLBACK WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
+              // Set 1ms timer resolution so SDL_Delay() is accurate and frame rate is stable.
+              SetHighResolutionTimer();
               // Set the Win32 working directory to the folder containing the executable
               // so that relative paths (e.g. "data/...") resolve correctly under UWP.
               wchar_t exePath[MAX_PATH] = {};
@@ -328,20 +346,41 @@ jobs:
           New-Item -ItemType Directory -Force -Path "AppxStage/data" | Out-Null
           Copy-Item "data/*" -Destination "AppxStage/data/" -Recurse -Force
 
+          # Decode the embedded Mario sprite (256x256 JPG) and resize it for each
+          # UWP asset slot. No game source files are changed — this only affects
+          # the launcher/tile icon shown in the Windows/Xbox games list.
           Add-Type -AssemblyName System.Drawing
-          function Make-Png($path, $w, $h) {
+          $iconB64 = "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"
+          $iconBytes  = [Convert]::FromBase64String($iconB64)
+          $iconStream = [System.IO.MemoryStream]::new($iconBytes)
+          $srcImg     = [System.Drawing.Image]::FromStream($iconStream)
+
+          # Helper: resize the Mario sprite onto a sky-blue background (matches the sprite)
+          function Make-Icon($path, $w, $h) {
               $bmp = New-Object System.Drawing.Bitmap($w, $h)
-              $g = [System.Drawing.Graphics]::FromImage($bmp)
-              $g.Clear([System.Drawing.Color]::FromArgb(255, 220, 40, 40))
+              $g   = [System.Drawing.Graphics]::FromImage($bmp)
+              $g.InterpolationMode  = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+              $g.SmoothingMode      = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+              $g.PixelOffsetMode    = [System.Drawing.Drawing2D.PixelOffsetMode]::HighQuality
+              # Sky-blue background (sampled from the sprite)
+              $g.Clear([System.Drawing.Color]::FromArgb(255, 100, 196, 220))
+              # Fit the sprite inside with padding, centred
+              $pad  = [int]([Math]::Min($w, $h) * 0.08)
+              $side = [Math]::Min($w, $h) - $pad * 2
+              $x    = ($w - $side) / 2
+              $y    = ($h - $side) / 2
+              $g.DrawImage($srcImg, [int]$x, [int]$y, [int]$side, [int]$side)
               $g.Dispose()
               $bmp.Save($path, [System.Drawing.Imaging.ImageFormat]::Png)
               $bmp.Dispose()
           }
-          Make-Png "AppxStage/Assets/Square150x150Logo.png" 150 150
-          Make-Png "AppxStage/Assets/Square44x44Logo.png" 44 44
-          Make-Png "AppxStage/Assets/Wide310x150Logo.png" 310 150
-          Make-Png "AppxStage/Assets/SplashScreen.png" 620 300
-          Make-Png "AppxStage/Assets/StoreLogo.png" 50 50
+          Make-Icon "AppxStage/Assets/Square150x150Logo.png" 150 150
+          Make-Icon "AppxStage/Assets/Square44x44Logo.png"   44  44
+          Make-Icon "AppxStage/Assets/Wide310x150Logo.png"   310 150
+          Make-Icon "AppxStage/Assets/SplashScreen.png"      620 300
+          Make-Icon "AppxStage/Assets/StoreLogo.png"         50  50
+          $srcImg.Dispose()
+          $iconStream.Dispose()
 
           $manifest = @'
           <?xml version="1.0" encoding="utf-8"?>
