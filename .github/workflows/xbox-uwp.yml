@@ -346,14 +346,14 @@ jobs:
           New-Item -ItemType Directory -Force -Path "AppxStage/data" | Out-Null
           Copy-Item "data/*" -Destination "AppxStage/data/" -Recurse -Force
 
-          # Decode the embedded Mario sprite (256x256 JPG) and resize it for each
+          # Download the Mario sprite icon from the repo and resize it for each
           # UWP asset slot. No game source files are changed — this only affects
           # the launcher/tile icon shown in the Windows/Xbox games list.
           Add-Type -AssemblyName System.Drawing
-          $iconB64 = "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"
-          $iconBytes  = [Convert]::FromBase64String($iconB64)
-          $iconStream = [System.IO.MemoryStream]::new($iconBytes)
-          $srcImg     = [System.Drawing.Image]::FromStream($iconStream)
+          $iconUrl  = "https://raw.githubusercontent.com/morid-kharab/supermariowar/master/resources/uwp-icon.jpg"
+          $iconPath = "uwp-icon.jpg"
+          Invoke-WebRequest -Uri $iconUrl -OutFile $iconPath -UseBasicParsing
+          $srcImg   = [System.Drawing.Image]::FromFile((Resolve-Path $iconPath).Path)
 
           # Helper: resize the Mario sprite onto a sky-blue background (matches the sprite)
           function Make-Icon($path, $w, $h) {
@@ -380,7 +380,7 @@ jobs:
           Make-Icon "AppxStage/Assets/SplashScreen.png"      620 300
           Make-Icon "AppxStage/Assets/StoreLogo.png"         50  50
           $srcImg.Dispose()
-          $iconStream.Dispose()
+          Remove-Item $iconPath -ErrorAction SilentlyContinue
 
           $manifest = @'
           <?xml version="1.0" encoding="utf-8"?>
