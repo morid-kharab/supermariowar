@@ -134,6 +134,16 @@ jobs:
           extern "C" int SDL_main(int argc, char *argv[]);
 
           int CALLBACK WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
+              // Set the Win32 working directory to the folder containing the executable
+              // so that relative paths (e.g. "data/...") resolve correctly under UWP.
+              wchar_t exePath[MAX_PATH] = {};
+              if (GetModuleFileNameW(nullptr, exePath, MAX_PATH) > 0) {
+                  wchar_t* lastSlash = wcsrchr(exePath, L'\\');
+                  if (lastSlash) {
+                      *lastSlash = L'\0';
+                      SetCurrentDirectoryW(exePath);
+                  }
+              }
               SDL_SetHint(SDL_HINT_WINRT_HANDLE_BACK_BUTTON, "1");
               SDL_SetHint(SDL_HINT_RENDER_DRIVER, "direct3d11");
               SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
@@ -312,7 +322,11 @@ jobs:
           $dllDir = Join-Path $env:VCPKG_INSTALLATION_ROOT "installed/x64-uwp/bin/*.dll"
           Copy-Item $dllDir -Destination "AppxStage/" -ErrorAction SilentlyContinue
 
-          Copy-Item "data/*" -Destination "AppxStage/" -Recurse -Force
+          # Preserve the outer "data" folder so the game finds "data/..." paths correctly.
+          # Copying data/* flat into AppxStage/ causes "ERROR: Empty map directory!" because
+          # makeappx sees empty sub-directories; keeping AppxStage/data/ intact fixes it.
+          New-Item -ItemType Directory -Force -Path "AppxStage/data" | Out-Null
+          Copy-Item "data/*" -Destination "AppxStage/data/" -Recurse -Force
 
           Add-Type -AssemblyName System.Drawing
           function Make-Png($path, $w, $h) {
